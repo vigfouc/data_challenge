@@ -294,8 +294,8 @@ def deform_mesh_by_regions(mesh: trimesh.Trimesh,
                            region_centers: dict,
                            random_state: int = 42) -> trimesh.Trimesh:
     """
-    Applique toutes les déformations locales définies dans region_deformations
-    à chaque centre de chaque région.
+    Applique TOUTES les déformations (scaling, twist, smooth_scaling, bend)
+    à TOUTES les régions, pour chaque centre.
     """
     rng = np.random.default_rng(random_state)
     m = mesh.copy()
@@ -307,30 +307,47 @@ def deform_mesh_by_regions(mesh: trimesh.Trimesh,
         centers = region_centers.get(region_name, [])
         if len(centers) == 0:
             continue
+
+        # paramètres région spécifiques
         params = region_deformations.get(region_name, {})
-        if not params:
-            continue
-        dtype = params.get("type", "scaling")
 
         for center in centers:
-            radius = params.get("radius", 0.05) * rng.uniform(0.9, 1.1)
 
-            if dtype == "scaling":
-                factor = params.get("factor", 1) * rng.uniform(0.9, 1.1)
-                m = local_scaling(m, center, radius, factor, mask=mask)
+            # Rayon avec petite variance
+            base_radius = params.get("radius", 0.05)
+            radius = base_radius * rng.uniform(0.9, 1.1)
 
-            elif dtype == "twist":
-                angle = params.get("angle", np.pi/20) * rng.uniform(0.9, 1.1)
-                axis_dir = rng.normal(size=3)
-                m = local_twist(m, center, axis_dir, radius, angle, mask=mask)
+            # ---------------------------
+            # 1) SCALING
+            # ---------------------------
+            factor = params.get("factor", 1.0) * rng.uniform(0.9, 1.1)
+            m = local_scaling(m, center, radius, factor, mask=mask)
 
-            elif dtype == "smooth_scaling":
-                factor = params.get("factor", 1) * rng.uniform(0.9, 1.1)
-                m = local_smooth_scale(m, center, radius, factor, mask=mask)
+            # ---------------------------
+            # 2) SMOOTH SCALING
+            # ---------------------------
+            sm_factor = params.get("factor", 1.0) * rng.uniform(0.9, 1.1)
+            m = local_smooth_scale(m, center, radius, sm_factor, mask=mask)
 
-            elif dtype == "bend":
-                intensity = params.get("intensity", 0.01) * rng.uniform(0.9, 1.1)
-                m = local_bend(m, center, radius, intensity, axis=None, mask=mask)
+            # ---------------------------
+            # 3) TWIST
+            # ---------------------------
+            angle = params.get("angle", np.pi / 20) * rng.uniform(0.9, 1.1)
+
+            axis_twist = rng.normal(size=3)
+            axis_twist /= np.linalg.norm(axis_twist) + 1e-9
+
+            m = local_twist(m, center, axis_twist, radius, angle, mask=mask)
+
+            # ---------------------------
+            # 4) BEND
+            # ---------------------------
+            intensity = params.get("intensity", 0.01) * rng.uniform(0.9, 1.1)
+
+            axis_bend = rng.normal(size=3)
+            axis_bend /= np.linalg.norm(axis_bend) + 1e-9
+
+            m = local_bend(m, center, radius, intensity, axis=axis_bend, mask=mask)
 
     return m
 
@@ -471,92 +488,142 @@ def reconstruct_vertices(flat_vertices: np.ndarray, dim: int = 3) -> np.ndarray:
     return flat_vertices.reshape(N, V, dim)
 
 # ============================================================================
-# MAIN EXEMPLE D'USAGE (corrigé)
+# MAIN EXEMPLE D'USAGE
 # ============================================================================
 if __name__ == "__main__":
     data_path = "data"
 
-    print("Chargement des meshes...")
+    # -------------------------------------------------------
+    print("=== Chargement des meshes ===")
+    # -------------------------------------------------------
     meshes = load_meshes(data_path)
-    print(f"Nombre de meshes chargés : {len(meshes)}")
-    print(f"Nombre de vertices par mesh : {meshes[0].vertices.shape[0]}")
-    print(f"Nombre de faces par mesh : {meshes[0].faces.shape[0]}")
+    print(f"→ {len(meshes)} meshes chargés")
+    print(f"→ {meshes[0].vertices.shape[0]} vertices, {meshes[0].faces.shape[0]} faces")
     print()
 
-    print("Création des splits...")
-    train, val, test = create_splits(meshes, split_ratios=(0.6,0.2,0.2))
-    print(f"Train: {len(train)}, Val: {len(val)}, Test: {len(test)}")
-    print()
-    
-    # Augmentation (local non-linear)
-    print("Augmentation locale non-linéaire des meshes (train)...")
-    train_aug = augment_meshes(train, num_augmented=10, random_state=42)
-    print(f"Train augmented: {len(train_aug)} meshes")
+    # -------------------------------------------------------
+    print("=== Création des splits ===")
+    # -------------------------------------------------------
+    train_mesh, val_mesh, test_mesh = create_splits(meshes, split_ratios=(0.6,0.2,0.2))
+    print(f"Train: {len(train_mesh)}  |  Val: {len(val_mesh)}  |  Test: {len(test_mesh)}")
     print()
 
-    print("Augmentation locale non-linéaire des meshes (val)...")
-    val_aug = augment_meshes(val, num_augmented=5, random_state=43)
-    print(f"Val augmented: {len(val_aug)} meshes")
+    # -------------------------------------------------------
+    print("=== Détection des points anatomiques globaux ===")
+    # -------------------------------------------------------
+    centroids = detect_anatomical_points(meshes, n_clusters=7, random_state=42)
+    labeled_mesh, example_labels = color_mesh_by_centroids(meshes[0], centroids)
+    print("Centroids shape:", centroids.shape)
     print()
 
-    # Conversion
-    print("Conversion du train en matrices applaties...")
-    X_train_flat = meshes_to_data(train_aug, mode="flat")
-    print("Shape d'une matrice applatie :", X_train_flat[0].shape)
-    print("Conversion numpy des matrices applaties...")
-    X_train_flat_np = np.array([x.numpy() for x in X_train_flat])
-    print("Shape numpy des matrices applaties :", X_train_flat_np.shape)
+    # -------------------------------------------------------
+    print("=== Application des labels à tous les meshes ===")
+    # -------------------------------------------------------
+
+    train_labels_list = [color_mesh_by_centroids(m, centroids)[1] for m in train_mesh]
+    val_labels_list   = [color_mesh_by_centroids(m, centroids)[1] for m in val_mesh]
+    test_labels_list  = [color_mesh_by_centroids(m, centroids)[1] for m in test_mesh]
+    print("Labels générés pour train/val/test.")
     print()
 
-    print("Conversion du val en matrices applaties...")
-    X_val_flat = meshes_to_data(val_aug, mode="flat")
-    print("Shape d'une matrice applatie de validation :", X_val_flat[0].shape)
-    print("Conversion numpy des matrices applaties de validation...")
-    X_val_flat_np = np.array([x.numpy() for x in X_val_flat])
-    print("Shape numpy des matrices applaties de validation :", X_val_flat_np.shape)
-    print()
+    # ==============================================================   
+    # PARAMÈTRES DES RÉGIONS
+    # ==============================================================
+    region_map = {
+        "head":                       0,
+        "lesser_trochanter":          1,
+        "greater_trochanter":         2,
+        "body":                       3,
+        "popliteal_patellar_surface": 4,
+        "medial_condyle":             5,
+        "lateral_condyle":            6,
+    }
 
-    print("Conversion du test en matrices applaties...")
-    X_test_flat = meshes_to_data(test, mode="flat")
-    print("Shape d'une matrice applatie de test :", X_test_flat[0].shape)
-    print("Conversion numpy des matrices applaties de test...")
-    X_test_flat_np = np.array([x.numpy() for x in X_test_flat])
-    print("Shape numpy des matrices applaties de test :", X_test_flat_np.shape)
-    print()
+    region_deformations = {
+        "head":                       {"type": "scaling", "factor": 1.02, "radius": 0.2},
+        "lesser_trochanter":          {"type": "scaling", "factor": 1.0, "radius": 0.08},
+        "greater_trochanter":         {"type": "scaling", "factor": 1.02, "radius": 0.1},
+        "body":                       {"type": "bend",    "intensity": 0.10, "radius": 0.40},
+        "popliteal_patellar_surface": {"type": "bend",    "intensity": 0.05, "radius": 0.20},
+        "medial_condyle":             {"type": "scaling", "factor": 1.02, "radius": 0.10},
+        "lateral_condyle":            {"type": "scaling", "factor": 1.02, "radius": 0.10},
+    }
 
-    print("Création des DataLoaders...")
-    datasets = {'train': X_train_flat, 'val': X_val_flat, 'test': X_test_flat}
-    loaders = create_data_loaders(datasets, batch_size=8, mode="flat")
-    print("DataLoaders créés pour train, val et test.")
-    print()
-
-    print("Reconstruction des vertices du train...")
-    vertices_reconstructed = reconstruct_vertices(
-        np.array([x.numpy() for x in X_train_flat])
+    # -------------------------------------------------------
+    print("=== Augmentation des meshes (train) ===")
+    # -------------------------------------------------------
+    train_aug = augment_meshes(
+        train_mesh,
+        train_labels_list,
+        region_deformations,
+        region_map,
+        num_augmented=10,
+        random_state=42
     )
-    print("Shape des vertices reconstruits :", vertices_reconstructed.shape)
+    print(f"→ {len(train_aug)} meshes augmentés")
     print()
 
-    print("Conversion du train en graphes PyG...")
+    # -------------------------------------------------------
+    print("=== Augmentation des meshes (val) ===")
+    # -------------------------------------------------------
+    val_aug = augment_meshes(
+        val_mesh,
+        val_labels_list,
+        region_deformations,
+        region_map,
+        num_augmented=5,
+        random_state=42
+    )
+    print(f"→ {len(val_aug)} meshes augmentés")
+    print()
+
+    # -------------------------------------------------------
+    print("=== Conversion en flat tensors ===")
+    # -------------------------------------------------------
+    X_train_flat = meshes_to_data(train_aug, mode="flat")
+    X_val_flat   = meshes_to_data(val_aug, mode="flat")
+    X_test_flat  = meshes_to_data(test_mesh, mode="flat")
+
+    X_train_flat_np = np.array([t.numpy() for t in X_train_flat])
+    print("Train flat shape:", X_train_flat_np.shape)
+    print()
+
+    # -------------------------------------------------------
+    print("=== DataLoaders (flat) ===")
+    # -------------------------------------------------------
+    datasets_flat = {'train': X_train_flat, 'val': X_val_flat, 'test': X_test_flat}
+    loaders_flat  = create_data_loaders(datasets_flat, batch_size=8, mode="flat")
+    print("DataLoaders flat OK.")
+    print()
+
+    # -------------------------------------------------------
+    print("=== Reconstruction vertices (vérification) ===")
+    # -------------------------------------------------------
+    reconstructed = reconstruct_vertices(X_train_flat_np)
+    print("Shape reconstructed:", reconstructed.shape)
+    print()
+
+    # -------------------------------------------------------
+    print("=== Conversion graph PyG ===")
+    # -------------------------------------------------------
     X_train_graph = meshes_to_data(train_aug, mode="graph")
-    print("Nombre de noeuds dans le graphe de train :", X_train_graph[0].x.shape[0])
-    print("Nombre d'arêtes dans le graphe de train :", X_train_graph[0].edge_index.shape[1])
+    X_val_graph   = meshes_to_data(val_aug,   mode="graph")
+    X_test_graph  = meshes_to_data(test_mesh, mode="graph")
+
+    print("Noeuds train:", X_train_graph[0].x.shape[0])
+    print("Arêtes train:", X_train_graph[0].edge_index.shape[1])
     print()
 
-    print("Conversion de la validation en graphes PyG...")
-    X_val_graph = meshes_to_data(val_aug, mode="graph")
-    print("Nombre de noeuds dans le graphe de validation :", X_val_graph[0].x.shape[0])
-    print("Nombre d'arêtes dans le graphe de validation :", X_val_graph[0].edge_index.shape[1])
-    print()
-
-    print("Conversion du test en graphes PyG...")
-    X_test_graph = meshes_to_data(test, mode="graph")
-    print("Nombre de noeuds dans le graphe de test :", X_test_graph[0].x.shape[0])
-    print("Nombre d'arêtes dans le graphe de test :", X_test_graph[0].edge_index.shape[1])
-    print()
-
-    print("Création des DataLoaders pour graphes...")
-    datasets_graph = {'train': X_train_graph, 'val': X_val_graph, 'test': X_test_graph}
+    # -------------------------------------------------------
+    print("=== DataLoaders PyG ===")
+    # -------------------------------------------------------
+    datasets_graph = {
+        'train': X_train_graph,
+        'val':   X_val_graph,
+        'test':  X_test_graph
+    }
     loaders_graph = create_data_loaders(datasets_graph, batch_size=4, mode="graph")
-    print("DataLoaders créés pour train, val et test (graphes).")
+    print("DataLoaders graph OK.")
     print()
+
+    print("=== Pipeline terminé ===")
