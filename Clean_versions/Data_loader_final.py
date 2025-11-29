@@ -305,105 +305,106 @@ def augment_non_linear_meshes(mesh_list, labels_list, region_deformations, regio
 # AUGMENT GEOMETRIC MESHES
 # ===========================
 
-def random_rotation(mesh, max_angle: float = 15.0):
-    """Rotation aléatoire autour des axes X, Y, Z"""
-    mesh_aug = copy.deepcopy(mesh)
-    angles = np.random.uniform(-max_angle, max_angle, 3) * np.pi / 180
+def random_rotation_gpu(verts: torch.Tensor, max_angle: float = 15.0) -> torch.Tensor:
+    angles = (torch.rand(3, device=verts.device) * 2 - 1) * max_angle * (torch.pi / 180)
 
-    # Matrices de rotation
-    Rx = trimesh.transformations.rotation_matrix(angles[0], [1, 0, 0])
-    Ry = trimesh.transformations.rotation_matrix(angles[1], [0, 1, 0])
-    Rz = trimesh.transformations.rotation_matrix(angles[2], [0, 0, 1])
-    
-    # Combinaison des rotations
-    R = trimesh.transformations.concatenate_matrices(Rz, Ry, Rx)
-    
-    mesh_aug.apply_transform(R)
-    return mesh_aug
+    def rot_matrix(angle, axis):
+        x, y, z = axis
+        c = torch.cos(angle)
+        s = torch.sin(angle)
+        C = 1 - c
+        return torch.tensor([
+            [x*x*C + c,   x*y*C - z*s, x*z*C + y*s],
+            [y*x*C + z*s, y*y*C + c,   y*z*C - x*s],
+            [z*x*C - y*s, z*y*C + x*s, z*z*C + c]
+        ], device=verts.device)
 
-def random_scale(mesh, scale_range: Tuple[float, float] = (0.95, 1.05)):
-    """Mise à l'échelle uniforme aléatoire"""
-    mesh_aug = copy.deepcopy(mesh)
-    scale = np.random.uniform(*scale_range)
-    mesh_aug.apply_scale(scale)
-    return mesh_aug
+    Rx = rot_matrix(angles[0], [1,0,0])
+    Ry = rot_matrix(angles[1], [0,1,0])
+    Rz = rot_matrix(angles[2], [0,0,1])
+    R = Rz @ Ry @ Rx
+    return verts @ R.T
 
-def random_noise(mesh, noise_std: float = 0.01):
-    """Ajout de bruit gaussien aux vertices"""
-    mesh_aug = copy.deepcopy(mesh)
-    vertices = mesh_aug.vertices.copy()
-    noise = np.random.normal(0, noise_std, vertices.shape)
-    mesh_aug.vertices += noise
-    return mesh_aug
+def random_scale_gpu(verts: torch.Tensor, scale_range: Tuple[float,float]=(0.95,1.05)) -> torch.Tensor:
+    scale = torch.empty(1, device=verts.device).uniform_(*scale_range)
+    return verts * scale
 
-def random_jitter(mesh, jitter_std: float = 0.005):
-    """Petites perturbations aléatoires aux vertices"""
-    mesh_aug = copy.deepcopy(mesh)
-    vertices = mesh_aug.vertices.copy()
-    jitter = np.random.normal(0, jitter_std, vertices.shape)
-    mesh_aug.vertices += jitter
-    return mesh_aug
+def random_jitter_gpu(verts: torch.Tensor, jitter_std: float = 0.005) -> torch.Tensor:
+    return verts + torch.randn_like(verts) * jitter_std
 
-def elastic_deformation(mesh, alpha: float = 0.02, sigma: float = 0.05):
-    """Déformation élastique douce"""
-    mesh_aug = copy.deepcopy(mesh)
-    vertices = mesh_aug.vertices.copy()
-    displacement = np.random.randn(*vertices.shape) * alpha
+def random_noise_gpu(verts: torch.Tensor, noise_std: float = 0.01) -> torch.Tensor:
+    return verts + torch.randn_like(verts) * noise_std
+
+def elastic_deformation_gpu(verts: torch.Tensor, alpha: float = 0.02, sigma: float = 0.05) -> torch.Tensor:
+    # Créer un déplacement aléatoire
+    disp = torch.randn_like(verts) * alpha
+    # Appliquer un lissage gaussien approximatif par dimension
     for i in range(3):
-        displacement[:, i] = gaussian_filter1d(displacement[:, i], sigma=sigma * len(vertices))
-    mesh_aug.vertices += displacement
-    return mesh_aug
+        disp[:, i] = torch.from_numpy(
+            gaussian_filter1d(disp[:, i].cpu().numpy(), sigma=sigma * verts.shape[0])
+        ).to(verts.device)
+    return verts + disp
 
 # ===========================
-# Fonction principale d'augmentation géométrique
+# Fonction principale GPU
 # ===========================
 
-def augment_geometric_meshes(mesh, aug_config: Dict):
+def augment_geometric_meshes(mesh_list, aug_config, device='cuda'):
     """
-    Applique de manière aléatoire plusieurs déformations géométriques sur un mesh trimesh
-    
-    Args:
-        mesh: trimesh.Trimesh
-        aug_config: dictionnaire contenant les probabilités et paramètres
-            {
-                'rotation_prob': float,
-                'rotation_max_angle': float,
-                'scale_prob': float,
-                'scale_range': (min_scale, max_scale),
-                'jitter_prob': float,
-                'jitter_std': float,
-                'noise_prob': float,
-                'noise_std': float,
-                'elastic_prob': float,
-                'elastic_alpha': float,
-                'elastic_sigma': float
-            }
-            
-    Returns:
-        mesh augmentée
+    Augmentation géométrique optimisée de tous les meshes en batch sur GPU.
     """
-    mesh_aug = copy.deepcopy(mesh)
-    
-    if np.random.rand() < aug_config.get('rotation_prob', 0.0):
-        mesh_aug = random_rotation(mesh_aug, max_angle=aug_config.get('rotation_max_angle', 15.0))
-        
-    if np.random.rand() < aug_config.get('scale_prob', 0.0):
-        mesh_aug = random_scale(mesh_aug, scale_range=aug_config.get('scale_range', (0.95, 1.05)))
-        
-    if np.random.rand() < aug_config.get('jitter_prob', 0.0):
-        mesh_aug = random_jitter(mesh_aug, jitter_std=aug_config.get('jitter_std', 0.005))
-        
-    if np.random.rand() < aug_config.get('noise_prob', 0.0):
-        mesh_aug = random_noise(mesh_aug, noise_std=aug_config.get('noise_std', 0.01))
-        
-    if np.random.rand() < aug_config.get('elastic_prob', 0.0):
-        mesh_aug = elastic_deformation(
-            mesh_aug, 
-            alpha=aug_config.get('elastic_alpha', 0.02),
-            sigma=aug_config.get('elastic_sigma', 0.05)
-        )
-        
-    return mesh_aug
+    n_verts_list = [m.vertices.shape[0] for m in mesh_list]
+    verts_all = torch.cat([torch.tensor(m.vertices, dtype=torch.float32, device=device)
+                           for m in mesh_list], dim=0)
+
+    N_total = verts_all.shape[0]
+    rng = torch.rand(1, device=device)
+
+    # Rotation
+    if rng < aug_config.get('rotation_prob', 0.0):
+        angles = (torch.rand(3, device=device) * 2 - 1) * aug_config.get('rotation_max_angle', 15.0) * (torch.pi/180)
+        Rx = torch.tensor([[1,0,0],[0,torch.cos(angles[0]),-torch.sin(angles[0])],
+                           [0,torch.sin(angles[0]),torch.cos(angles[0])]], device=device)
+        Ry = torch.tensor([[torch.cos(angles[1]),0,torch.sin(angles[1])],[0,1,0],
+                           [-torch.sin(angles[1]),0,torch.cos(angles[1])]], device=device)
+        Rz = torch.tensor([[torch.cos(angles[2]),-torch.sin(angles[2]),0],
+                           [torch.sin(angles[2]),torch.cos(angles[2]),0],
+                           [0,0,1]], device=device)
+        R = Rz @ Ry @ Rx
+        verts_all = verts_all @ R.T
+
+    # Scaling
+    if rng < aug_config.get('scale_prob', 0.0):
+        scale = torch.empty(1, device=device).uniform_(*aug_config.get('scale_range', (0.95, 1.05)))
+        verts_all = verts_all * scale
+
+    # Jitter
+    if rng < aug_config.get('jitter_prob', 0.0):
+        verts_all += torch.randn_like(verts_all) * aug_config.get('jitter_std', 0.005)
+
+    # Noise
+    if rng < aug_config.get('noise_prob', 0.0):
+        verts_all += torch.randn_like(verts_all) * aug_config.get('noise_std', 0.01)
+
+    # Elastic
+    if rng < aug_config.get('elastic_prob', 0.0):
+        alpha = aug_config.get('elastic_alpha', 0.02)
+        sigma = aug_config.get('elastic_sigma', 0.05)
+        disp = torch.randn_like(verts_all) * alpha
+        # Filtrage gaussien par dimension, vectorisé avec torch.split
+        for i in range(3):
+            disp[:, i] = torch.from_numpy(
+                gaussian_filter1d(disp[:, i].cpu().numpy(), sigma=sigma * N_total)
+            ).to(device)
+        verts_all += disp
+
+    # Reconstruction meshes en batch avec torch.split
+    verts_split = torch.split(verts_all, n_verts_list)
+    meshes_aug = [trimesh.Trimesh(vertices=v.cpu().numpy(), faces=mesh_list[0].faces, process=False)
+                  for v in verts_split]
+
+    return meshes_aug
+
 
 # ===========================
 # AUGMENT Linear MESHES (PCA)
@@ -596,7 +597,7 @@ if __name__ == "__main__":
     print(f"→ {len(train_aug_nl)} meshes augmentés (non-linéaire)\n")
 
     print("=== Augmentation géométrique sur meshes PCA (train) ===")
-    train_aug_geo = [augment_geometric_meshes(m, aug_config) for m in train_aug_lin]
+    train_aug_geo = augment_geometric_meshes(train_aug_lin, aug_config)
     print(f"→ {len(train_aug_geo)} meshes augmentés (géométrique)\n")
 
     # Même chose pour val
@@ -613,7 +614,7 @@ if __name__ == "__main__":
     print(f"→ {len(val_aug_nl)} meshes augmentés (non-linéaire)\n")
 
     print("=== Augmentation géométrique sur meshes PCA (val) ===")
-    val_aug_geo = [augment_geometric_meshes(m, aug_config) for m in val_aug_lin]
+    val_aug_geo = augment_geometric_meshes(val_aug_lin, aug_config)
     print(f"→ {len(val_aug_geo)} meshes augmentés (géométrique)\n")
 
     # ===========================
