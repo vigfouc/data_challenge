@@ -196,7 +196,7 @@ def radial_wave_inplace(m, v, mask, rel, w, amplitude, frequency):
 
 def plane_squeeze_inplace(m, v, mask, rel, plane_normal, strength):
     dist = rel @ plane_normal
-    w = np.exp(-(dist / np.max([1e-12, dist.max()]) / 1.0)**2)  # optional
+    w = np.exp(-(dist / np.max([1e-12, dist.max()]) / 1.0)**2)
     v[mask] -= plane_normal * (dist * strength * w)[:, None]
 
 def local_shear_inplace(m, v, mask, rel, shear_axis, shear_dir, amount):
@@ -287,18 +287,140 @@ def deform_mesh_by_regions(mesh: trimesh.Trimesh,
     return m
 
 # ===========================
-# AUGMENT MESHES (Optimized)
+# AUGMENT NON-Linear MESHES (Optimized)
 # ===========================
-def augment_meshes(mesh_list, labels_list, region_deformations, region_map,
-                   num_augmented=5, n_centers_per_region=1, random_state=42):
+def augment_non_linear_meshes(mesh_list, labels_list, region_deformations, region_map,
+                   augmentation_factor=5, n_centers_per_region=1, random_state=42):
     rng = np.random.default_rng(random_state)
     augmented = []
 
     for mesh, labels in zip(mesh_list, labels_list):
         region_centers = compute_region_centers(mesh, labels, region_map, n_centers_per_region=n_centers_per_region)
-        for _ in range(num_augmented):
+        for _ in range(augmentation_factor):
             new_mesh = deform_mesh_by_regions(mesh, labels, region_deformations, region_map, region_centers, random_state=int(rng.integers(1e9)))
             augmented.append(new_mesh)
+    return augmented
+
+# ===========================
+# AUGMENT GEOMETRIC MESHES
+# ===========================
+
+def random_rotation(mesh, max_angle: float = 15.0):
+    """Rotation aléatoire autour des axes X, Y, Z"""
+    mesh_aug = copy.deepcopy(mesh)
+    angles = np.random.uniform(-max_angle, max_angle, 3) * np.pi / 180
+
+    # Matrices de rotation
+    Rx = trimesh.transformations.rotation_matrix(angles[0], [1, 0, 0])
+    Ry = trimesh.transformations.rotation_matrix(angles[1], [0, 1, 0])
+    Rz = trimesh.transformations.rotation_matrix(angles[2], [0, 0, 1])
+    
+    # Combinaison des rotations
+    R = trimesh.transformations.concatenate_matrices(Rz, Ry, Rx)
+    
+    mesh_aug.apply_transform(R)
+    return mesh_aug
+
+def random_scale(mesh, scale_range: Tuple[float, float] = (0.95, 1.05)):
+    """Mise à l'échelle uniforme aléatoire"""
+    mesh_aug = copy.deepcopy(mesh)
+    scale = np.random.uniform(*scale_range)
+    mesh_aug.apply_scale(scale)
+    return mesh_aug
+
+def random_noise(mesh, noise_std: float = 0.01):
+    """Ajout de bruit gaussien aux vertices"""
+    mesh_aug = copy.deepcopy(mesh)
+    vertices = mesh_aug.vertices.copy()
+    noise = np.random.normal(0, noise_std, vertices.shape)
+    mesh_aug.vertices += noise
+    return mesh_aug
+
+def random_jitter(mesh, jitter_std: float = 0.005):
+    """Petites perturbations aléatoires aux vertices"""
+    mesh_aug = copy.deepcopy(mesh)
+    vertices = mesh_aug.vertices.copy()
+    jitter = np.random.normal(0, jitter_std, vertices.shape)
+    mesh_aug.vertices += jitter
+    return mesh_aug
+
+def elastic_deformation(mesh, alpha: float = 0.02, sigma: float = 0.05):
+    """Déformation élastique douce"""
+    mesh_aug = copy.deepcopy(mesh)
+    vertices = mesh_aug.vertices.copy()
+    displacement = np.random.randn(*vertices.shape) * alpha
+    for i in range(3):
+        displacement[:, i] = gaussian_filter1d(displacement[:, i], sigma=sigma * len(vertices))
+    mesh_aug.vertices += displacement
+    return mesh_aug
+
+# ===========================
+# Fonction principale d'augmentation géométrique
+# ===========================
+
+def augment_geometric_meshes(mesh, aug_config: Dict):
+    """
+    Applique de manière aléatoire plusieurs déformations géométriques sur un mesh trimesh
+    
+    Args:
+        mesh: trimesh.Trimesh
+        aug_config: dictionnaire contenant les probabilités et paramètres
+            {
+                'rotation_prob': float,
+                'rotation_max_angle': float,
+                'scale_prob': float,
+                'scale_range': (min_scale, max_scale),
+                'jitter_prob': float,
+                'jitter_std': float,
+                'noise_prob': float,
+                'noise_std': float,
+                'elastic_prob': float,
+                'elastic_alpha': float,
+                'elastic_sigma': float
+            }
+            
+    Returns:
+        mesh augmentée
+    """
+    mesh_aug = copy.deepcopy(mesh)
+    
+    if np.random.rand() < aug_config.get('rotation_prob', 0.0):
+        mesh_aug = random_rotation(mesh_aug, max_angle=aug_config.get('rotation_max_angle', 15.0))
+        
+    if np.random.rand() < aug_config.get('scale_prob', 0.0):
+        mesh_aug = random_scale(mesh_aug, scale_range=aug_config.get('scale_range', (0.95, 1.05)))
+        
+    if np.random.rand() < aug_config.get('jitter_prob', 0.0):
+        mesh_aug = random_jitter(mesh_aug, jitter_std=aug_config.get('jitter_std', 0.005))
+        
+    if np.random.rand() < aug_config.get('noise_prob', 0.0):
+        mesh_aug = random_noise(mesh_aug, noise_std=aug_config.get('noise_std', 0.01))
+        
+    if np.random.rand() < aug_config.get('elastic_prob', 0.0):
+        mesh_aug = elastic_deformation(
+            mesh_aug, 
+            alpha=aug_config.get('elastic_alpha', 0.02),
+            sigma=aug_config.get('elastic_sigma', 0.05)
+        )
+        
+    return mesh_aug
+
+# ===========================
+# AUGMENT Linear MESHES (PCA)
+# ===========================
+def augment_linear_meshes(mesh_list, num_gen=5, random_state=42):
+    rng = np.random.default_rng(random_state)
+    all_vertices = np.array([m.vertices.flatten() for m in mesh_list])
+    pca = PCA(n_components=0.999, random_state=random_state)
+    pca.fit(all_vertices)
+
+    augmented = []
+    for _ in range(num_gen):
+        coeffs = rng.normal(scale=0.1, size=pca.n_components_)
+        new_flat = pca.mean_ + coeffs @ pca.components_
+        new_verts = new_flat.reshape(-1, 3)
+        new_mesh = trimesh.Trimesh(vertices=new_verts, faces=mesh_list[0].faces, process=False)
+        augmented.append(new_mesh)
     return augmented
 
 # ============================================================================
@@ -399,27 +521,39 @@ if __name__ == "__main__":
     print("=== Chargement des meshes ===")
     meshes = load_meshes(data_path)
     print(f"→ {len(meshes)} meshes chargés")
-    print(f"→ {meshes[0].vertices.shape[0]} vertices, {meshes[0].faces.shape[0]} faces")
-    print()
+    print(f"→ {meshes[0].vertices.shape[0]} vertices, {meshes[0].faces.shape[0]} faces\n")
 
     print("=== Création des splits ===")
     train_mesh, val_mesh, test_mesh = create_splits(meshes, split_ratios=(0.6,0.2,0.2))
-    print(f"Train: {len(train_mesh)}  |  Val: {len(val_mesh)}  |  Test: {len(test_mesh)}")
-    print()
+    print(f"Train: {len(train_mesh)}  |  Val: {len(val_mesh)}  |  Test: {len(test_mesh)}\n")
 
     print("=== Détection des points anatomiques globaux ===")
     centroids = detect_anatomical_points(meshes, n_clusters=7, random_state=42)
     labeled_mesh, example_labels = color_mesh_by_centroids(meshes[0], centroids)
-    print("Centroids shape:", centroids.shape)
-    print()
+    print("Centroids shape:", centroids.shape, "\n")
 
     print("=== Application des labels à tous les meshes ===")
     train_labels_list = [color_mesh_by_centroids(m, centroids)[1] for m in train_mesh]
     val_labels_list   = [color_mesh_by_centroids(m, centroids)[1] for m in val_mesh]
     test_labels_list  = [color_mesh_by_centroids(m, centroids)[1] for m in test_mesh]
-    print("Labels générés pour train/val/test.")
-    print()
+    print("Labels générés pour train/val/test.\n")
 
+    # ===========================
+    # AUGMENTATION LINÉAIRE (PCA)
+    # ===========================
+    print("=== Augmentation linéaire (PCA) train ===")
+    train_aug_lin = augment_linear_meshes(train_mesh, num_gen=5, random_state=42)
+    print(f"→ {len(train_aug_lin)} meshes augmentés (linéaire)\n")
+
+    print("=== Augmentation linéaire (PCA) val ===")
+    val_aug_lin = augment_linear_meshes(val_mesh, num_gen=3, random_state=42)
+    print(f"→ {len(val_aug_lin)} meshes augmentés (linéaire)\n")
+
+    # ===========================
+    # AUGMENTATION GÉOMÉTRIQUE / NON-LINÉAIRE SUR LES MESHS PCA
+    # ===========================
+
+    # Déformations locales par région
     region_map = {
         "head":                       0,
         "lesser_trochanter":          1,
@@ -431,76 +565,97 @@ if __name__ == "__main__":
     }
 
     region_deformations = {
-    "head":                       {"deforms":[{"type":"scaling","factor":1.02,"radius":0.2}]},
-    "lesser_trochanter":          {"deforms":[{"type":"scaling","factor":1.0,"radius":0.08}]},
-    "greater_trochanter":         {"deforms":[{"type":"scaling","factor":1.02,"radius":0.1}]},
-    "body":                       {"deforms":[{"type":"bend","intensity":0.10,"radius":0.40}]},
-    "popliteal_patellar_surface": {"deforms":[{"type":"bend","intensity":0.05,"radius":0.20}]},
-    "medial_condyle":             {"deforms":[{"type":"scaling","factor":1.02,"radius":0.10}]},
-    "lateral_condyle":            {"deforms":[{"type":"scaling","factor":1.02,"radius":0.10}]},
+        "head":                       {"deforms":[{"type":"scaling","factor":1.02,"radius":0.2}]},
+        "lesser_trochanter":          {"deforms":[{"type":"scaling","factor":1.0,"radius":0.08}]},
+        "greater_trochanter":         {"deforms":[{"type":"scaling","factor":1.02,"radius":0.1}]},
+        "body":                       {"deforms":[{"type":"bend","intensity":0.10,"radius":0.40}]},
+        "popliteal_patellar_surface": {"deforms":[{"type":"bend","intensity":0.05,"radius":0.20}]},
+        "medial_condyle":             {"deforms":[{"type":"scaling","factor":1.02,"radius":0.10}]},
+        "lateral_condyle":            {"deforms":[{"type":"scaling","factor":1.02,"radius":0.10}]},
     }
 
-    print("=== Augmentation des meshes (train) ===")
-    train_aug = augment_meshes(
-        train_mesh,
-        train_labels_list,
+    # Config géométrique
+    aug_config = {
+        'rotation_prob': 0.7, 'rotation_max_angle': 15.0,
+        'scale_prob': 0.5, 'scale_range': (0.95, 1.05),
+        'jitter_prob': 0.5, 'jitter_std': 0.005,
+        'noise_prob': 0.5, 'noise_std': 0.01,
+        'elastic_prob': 0.3, 'elastic_alpha': 0.02, 'elastic_sigma': 0.05
+    }
+
+    print("=== Augmentation non-linéaire sur meshes PCA (train) ===")
+    train_aug_nl = augment_non_linear_meshes(
+        train_aug_lin,
+        train_labels_list,  # labels du train original
         region_deformations,
         region_map,
-        num_augmented=10,
+        augmentation_factor=2,  # nombre d’itérations non-linéaires par mesh PCA
+        n_centers_per_region=1,
         random_state=42
     )
-    print(f"→ {len(train_aug)} meshes augmentés")
-    print()
+    print(f"→ {len(train_aug_nl)} meshes augmentés (non-linéaire)\n")
 
-    print("=== Augmentation des meshes (val) ===")
-    val_aug = augment_meshes(
-        val_mesh,
+    print("=== Augmentation géométrique sur meshes PCA (train) ===")
+    train_aug_geo = [augment_geometric_meshes(m, aug_config) for m in train_aug_lin]
+    print(f"→ {len(train_aug_geo)} meshes augmentés (géométrique)\n")
+
+    # Même chose pour val
+    print("=== Augmentation non-linéaire sur meshes PCA (val) ===")
+    val_aug_nl = augment_non_linear_meshes(
+        val_aug_lin,
         val_labels_list,
         region_deformations,
         region_map,
-        num_augmented=5,
+        augmentation_factor=1,
+        n_centers_per_region=1,
         random_state=42
     )
-    print(f"→ {len(val_aug)} meshes augmentés")
-    print()
+    print(f"→ {len(val_aug_nl)} meshes augmentés (non-linéaire)\n")
 
-    print("=== Conversion en flat tensors ===")
-    X_train_flat = meshes_to_data(train_aug, mode="flat")
-    X_val_flat   = meshes_to_data(val_aug, mode="flat")
-    X_test_flat  = meshes_to_data(test_mesh, mode="flat")
+    print("=== Augmentation géométrique sur meshes PCA (val) ===")
+    val_aug_geo = [augment_geometric_meshes(m, aug_config) for m in val_aug_lin]
+    print(f"→ {len(val_aug_geo)} meshes augmentés (géométrique)\n")
+
+    # ===========================
+    # COMBINAISON DES AUGMENTATIONS
+    # ===========================
+    train_all = train_mesh + train_aug_lin + train_aug_nl + train_aug_geo
+    val_all   = val_mesh   + val_aug_lin   + val_aug_nl   + val_aug_geo
+    test_all  = test_mesh
+
+    print(f"Total train meshes après augmentation: {len(train_all)}")
+    print(f"Total val meshes après augmentation: {len(val_all)}")
+    print(f"Total test meshes: {len(test_all)}\n")
+
+    # ===========================
+    # CONVERSION EN FLAT TENSORS
+    # ===========================
+    X_train_flat = meshes_to_data(train_all, mode="flat")
+    X_val_flat   = meshes_to_data(val_all, mode="flat")
+    X_test_flat  = meshes_to_data(test_all, mode="flat")
 
     X_train_flat_np = np.array([t.numpy() for t in X_train_flat])
-    print("Train flat shape:", X_train_flat_np.shape)
-    print()
+    print("Train flat shape:", X_train_flat_np.shape, "\n")
 
-    print("=== DataLoaders (flat) ===")
+    # ===========================
+    # DATALOADERS
+    # ===========================
     datasets_flat = {'train': X_train_flat, 'val': X_val_flat, 'test': X_test_flat}
     loaders_flat  = create_data_loaders(datasets_flat, batch_size=8, mode="flat")
-    print("DataLoaders flat OK.")
-    print()
+    print("DataLoaders flat OK.\n")
 
-    print("=== Reconstruction vertices (vérification) ===")
-    reconstructed = reconstruct_vertices(X_train_flat_np)
-    print("Shape reconstructed:", reconstructed.shape)
-    print()
-
-    print("=== Conversion graph PyG ===")
-    X_train_graph = meshes_to_data(train_aug, mode="graph")
-    X_val_graph   = meshes_to_data(val_aug,   mode="graph")
-    X_test_graph  = meshes_to_data(test_mesh, mode="graph")
+    # ===========================
+    # CONVERSION EN GRAPH PYG
+    # ===========================
+    X_train_graph = meshes_to_data(train_all, mode="graph")
+    X_val_graph   = meshes_to_data(val_all, mode="graph")
+    X_test_graph  = meshes_to_data(test_all, mode="graph")
 
     print("Noeuds train:", X_train_graph[0].x.shape[0])
-    print("Arêtes train:", X_train_graph[0].edge_index.shape[1])
-    print()
+    print("Arêtes train:", X_train_graph[0].edge_index.shape[1], "\n")
 
-    print("=== DataLoaders PyG ===")
-    datasets_graph = {
-        'train': X_train_graph,
-        'val':   X_val_graph,
-        'test':  X_test_graph
-    }
+    datasets_graph = {'train': X_train_graph, 'val': X_val_graph, 'test': X_test_graph}
     loaders_graph = create_data_loaders(datasets_graph, batch_size=4, mode="graph")
-    print("DataLoaders graph OK.")
-    print()
+    print("DataLoaders graph OK.\n")
 
     print("=== Pipeline terminé ===")
